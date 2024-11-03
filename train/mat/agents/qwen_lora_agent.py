@@ -18,6 +18,7 @@ from peft import (
 )
 import os
 from peft import PeftModel
+# APPOCritic
 from mat.models.critic import APPOCritic, TPPOCritic
 
 # 一个qwen+lora的model充当代理 
@@ -71,14 +72,16 @@ class QwenLoRAgent:
                 lora_weights,
                 torch_dtype=torch.float16,
             )
-
         model.half()
         return model
 
+    # xxw 初始化critic
     def _init_critic(self, critic_weights = None):
         if self.algo == "APPO":
             # 利用APPOCritic充当critic
             # critic从actor(lora model)初始化而来
+            # APPOCritic里面就是把model做了线性映射，n_embd -> 1024 -> 512 -> 1
+            # 本质就是对一个输入x打一个分
             critic = APPOCritic(self.actor, self.tokenizer)
         elif self.algo == "TPPO":
             critic = TPPOCritic(self.actor, self.tokenizer)
@@ -123,16 +126,18 @@ class QwenLoRAgent:
         actions = np.array(actions, dtype=np.object_)
         
         return actions, action_tokens
-        
+       
+    # 获取当前action的value值
     def get_action_values(self, obs):
         obs = obs.tolist()
+        # 先转换为token
         inputs = self.tokenizer(obs, return_tensors="pt", padding=True)
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
         
         with self.actor.disable_adapter():
+            # 给token做编码，做线性映射，得到一个value值
             values = self.critic(input_ids, attention_mask=attention_mask)
-        # values = values.detach().float().cpu().numpy()
         return values
     
     def get_slice(self, logits, obs_full_lengths, act_real_lengths):
@@ -160,20 +165,30 @@ class QwenLoRAgent:
             values = self.critic(obs_act_ids, attention_mask=obs_act_mask)
         values = self.get_slice(values, obs_full_lengths, act_real_lengths)
         return values
-    
+
+    # xxw core
+    # get_token_logits 的目的是生成智能体在给定观测（obs）和动作（action_tokens）条件下的策略输出
     def get_token_logits(self, obs, action_tokens, batch_infer=False):
         
+        # 首先使用 self.tokenizer 对 obs 进行编码，得到一个 tokens 序列，以便于进入模型进行处理
         obs_token_seq = self.tokenizer(obs.tolist(), return_tensors="pt", padding=True)
+
+        # 得到 obs_token_seq 的 input_ids 和 attention_mask，并将它们转移到CUDA（GPU）上进行加速计算。
         obs_input_ids = obs_token_seq["input_ids"].to("cuda")
         obs_attn_mask = obs_token_seq["attention_mask"].to("cuda")
         obs_full_lengths = obs_input_ids.shape[1]
-        
+
+        # act_attn_mask 用于标识非零（即有效）动作token。这帮助计算每个动作序列的真实长度 act_real_lengths
         act_attn_mask = (action_tokens != 0)
         act_real_lengths = act_attn_mask.sum(dim=1)
-        
+
+        # 将 obs_input_ids 和 action_tokens 连接起来形成新的输入 obs_act_ids，是为了将观测状态和动作信息结合在一起，以便模型能够在理解当前环境状态的同时，考虑到其可能采取的动作
+        # 在许多任务中，智能体需要根据当前的环境状态（obs）来选择合适的动作（action）-> 将两者连接起来，可以让模型同时具备关于环境和自身已采取或计划采取的动作的完整上下文。
         obs_act_ids = torch.cat([obs_input_ids, action_tokens], dim=1)
         obs_act_mask = torch.cat([obs_attn_mask, act_attn_mask], dim=1)
-        
+       
+        # batch_infer 步骤的主要任务是通过模型进行推理，以获取关于这些输入的输出logits
+        # 这种推理的目的是根据合并后的输入序列，让模型生成有关策略决策的信息，也就是 pi_logits 和 rho_logits
         if batch_infer:
             with self.actor.disable_adapter():
                 rho_logits = self.batch_infer(self.actor, obs_act_ids, obs_act_mask, obs_full_lengths, act_real_lengths)
@@ -187,6 +202,8 @@ class QwenLoRAgent:
             pi_outputs = self.actor(input_ids=obs_act_ids, attention_mask=obs_act_mask, return_dict=True)
             pi_logits = self.get_slice(pi_outputs.logits, obs_full_lengths, act_real_lengths)
         
+        # pi_logits: 被用于估计或采样行为策略，它提供了关于在特定环境状态下选择哪些可能动作的概率分布
+        # rho_logits：可以用于策略基准修正或作为选择策略梯度更新的参考。这可能涉及到计算优势或者对比不同策略的效果，以便更好地更新和调整模型的策略。 
         return pi_logits, rho_logits
     
     def batch_infer(self, model, input_ids, attn_mask, obs_full_lengths, act_real_lengths, infer_batch_size=16):     
@@ -208,23 +225,44 @@ class QwenLoRAgent:
             pos -= 1
         return pos
 
+    # xxw core 获取action model的log prob
     def get_joint_action_log_probs(self, obs, action_tokens, batch_infer=False):
+
+        # obs: 当前观测的输入
+        # action_tokens: 与动作对应的token序列
+        # pi_logits: 被用于估计或采样行为策略，它提供了关于在特定环境状态下选择哪些可能动作的概率分布
         pi_logits, _ = self.get_token_logits(obs, action_tokens, batch_infer=batch_infer)
+
+        # 通过torch.log_softmax计算这些logits的log-softmax
+        # log-softmax给出了智能体在特定观察条件obs下采取每一个可能动作action的倾向性或优先级。
         pi_log_softmax = torch.log_softmax(pi_logits, dim=-1)
+
+        # 初始化action_log_probs和entropies列表
+        # 用于存储每个样本的log概率和熵
         action_log_probs = []
         entropies = []
+
+        # 逐序列计算:
         for i in range(pi_logits.shape[0]):
+            # 确定动作序列的有效长度act_token_length
             act_token_length = self.get_last_token_position(action_tokens[i]) + 1
+            # 提取当前序列的log_softmax_slice和action_token_slice
+            # 目的是为了处理每个动作序列的特定片段，从而计算该序列的联合log概率
+            # action_token_slice是与log_softmax_slice对应的动作token序列，这些token指示在特定时间步上智能体实际采取的动作。
             log_softmax_slice = pi_log_softmax[i, :act_token_length, :]
             action_token_slice = action_tokens[i, :act_token_length]
+            # 使用这两个切片之后，可以通过torch.gather从log_softmax_slice中选择action_token_slice所指示的位置的log概率。
             token_log_probs = torch.gather(log_softmax_slice, -1, action_token_slice.unsqueeze(-1)).squeeze(-1)
+            # 对这些log概率求和，得到该序列的联合log概率 action_log_prob，并存储。
             action_log_prob = token_log_probs.sum()
             action_log_probs.append(action_log_prob)
-            
+            # 使用categorical分布基于「当前动作token的logits」计算熵。
             entropy = Categorical(logits=pi_logits[i, :act_token_length, :]).entropy().mean()
             entropies.append(entropy)
         action_log_probs = torch.stack(action_log_probs)
         entropies = torch.stack(entropies)
+        # log probability: 用于策略梯度更新中作为目标函数计算的一部分。
+        # entropy: 可用于促进策略探索，增加策略的随机性以帮助空间探索更优策略，并在训练过程中用作正则项。
         return action_log_probs, entropies
     
     @torch.no_grad()
@@ -287,9 +325,13 @@ class QwenLoRAgent:
             return np.zeros((obs.shape[0],)) # fake values, grpo does not use critic
         else: 
             raise NotImplementedError
-        
+    # xxw core
+    # obs：当前智能体的观测
+    # action_tokens：智能体针对观测做出的动作
     def infer_for_action_update(self, obs, action_tokens= None):
         assert action_tokens is not None, "action_tokens could not be none"
+        # action_log_probs：用于策略梯度更新中作为目标函数计算的一部分
+        # entropies：可用于促进策略探索，增加策略的随机性以帮助空间探索更优策略，并在训练过程中用作正则项
         action_log_probs, entropies = self.get_joint_action_log_probs(obs, action_tokens)
         return action_log_probs, entropies
     
