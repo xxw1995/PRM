@@ -20,7 +20,7 @@ def preprocess_function(example):
         max_length=2048,
     )
     length = len(tokenized_inputs['input_ids'])
-    # 
+    # step_tag_id 和 candidate_tokens 作为标记。
     indices = find_all_indices(tokenized_inputs['input_ids'], step_tag_id)
     if len(indices) != len(example['label']):
         example['label'] = example['label'][:len(indices)]
