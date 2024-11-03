@@ -266,12 +266,19 @@ class QwenLoRAgent:
         return action_log_probs, entropies
     
     @torch.no_grad()
+    # 用于在给定的观测值obs下执行动作推理 
     def infer_for_rollout(self, obs):
+        # 调用 self.get_actions(obs) 获取基于当前「观测值obs」的「动作action」及其对应的「动作token action_tokens」
         actions, action_tokens = self.get_actions(obs)
-        
+        # 函数根据不同的算法（如 “APPO”、“TPPO”、“GRPO”）来处理推理步骤
         if self.algo == "APPO":
+            """
+            APPO（近似策略优化）
+            """
+            # 调用self.get_action_values(obs)计算当前观测下的动作值。
             values = self.get_action_values(obs)
             values = values.float().cpu().numpy()
+            # 计算给定观测obs和动作令牌action token下的动作对数概率。
             action_log_probs, _ = self.get_joint_action_log_probs(obs, action_tokens, batch_infer=True)
             action_tokens = action_tokens.int().cpu().numpy()
             action_log_probs = action_log_probs.float().cpu().numpy()
@@ -294,7 +301,7 @@ class QwenLoRAgent:
             log_probs = action_log_probs
         else:
             raise NotImplementedError
-
+        # 动作、动作token、价值评估、动作的对数概率
         return actions, action_tokens, values, log_probs
     
     def get_next_tppo_values(self, obs): 
